@@ -119,21 +119,17 @@ impl CodeMapper {
         }
 
         let mut offset = 12;
-        let mut table = Vec::with_capacity(table_len);
-        for _ in 0..table_len {
-            table.push(u32::from_le_bytes(
-                bytes[offset..offset + 4].try_into().unwrap(),
-            ));
-            offset += 4;
-        }
+        let table: Vec<u32> = bytes[offset..offset + table_len * 4]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        offset += table_len * 4;
 
-        let mut reverse_table = Vec::with_capacity(reverse_len);
-        for _ in 0..reverse_len {
-            reverse_table.push(u32::from_le_bytes(
-                bytes[offset..offset + 4].try_into().unwrap(),
-            ));
-            offset += 4;
-        }
+        let reverse_table: Vec<u32> = bytes[offset..offset + reverse_len * 4]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        offset += reverse_len * 4;
 
         Some((
             Self {

@@ -1,5 +1,12 @@
 use crate::{CodeMapper, DoubleArray, Label, Node};
 
+/// Mutable state used during trie construction.
+struct BuildContext {
+    nodes: Vec<Node>,
+    siblings: Vec<u32>,
+    free_list: FreeList,
+}
+
 /// Doubly-linked circular free list for managing unused node slots.
 struct FreeList {
     /// prev[i] and next[i] form a circular doubly-linked list of free indices.
@@ -85,6 +92,141 @@ impl FreeList {
     }
 }
 
+impl BuildContext {
+    fn new(capacity: usize) -> Self {
+        let mut free_list = FreeList::new(capacity);
+        free_list.remove(0); // root is at index 0
+        Self {
+            nodes: vec![Node::default(); capacity],
+            siblings: vec![0u32; capacity],
+            free_list,
+        }
+    }
+
+    /// Ensures all arrays cover at least `new_cap` indices.
+    fn ensure_capacity(&mut self, new_cap: usize) {
+        if new_cap > self.nodes.len() {
+            self.nodes.resize(new_cap, Node::default());
+            self.siblings.resize(new_cap, 0);
+            self.free_list.grow(new_cap);
+        }
+    }
+
+    /// Recursively places children for keys[begin..end] at the given depth.
+    fn build_rec(
+        &mut self,
+        coded_keys: &[Vec<u32>],
+        begin: usize,
+        end: usize,
+        depth: usize,
+        parent: u32,
+    ) {
+        // Collect distinct child labels and their key ranges
+        let mut children: Vec<(u32, usize, usize)> = Vec::new(); // (code, begin, end)
+        let mut i = begin;
+        while i < end {
+            let code = coded_keys[i][depth];
+            let child_begin = i;
+            i += 1;
+            while i < end && coded_keys[i][depth] == code {
+                i += 1;
+            }
+            children.push((code, child_begin, i));
+        }
+
+        // Find a base such that base XOR code is free for all children
+        let base = self.find_base(&children);
+        self.nodes[parent as usize].set_base(base);
+
+        // Place child nodes
+        let mut child_indices: Vec<u32> = Vec::with_capacity(children.len());
+        for &(code, _, _) in &children {
+            let child_idx = base ^ code;
+            child_indices.push(child_idx);
+            self.free_list.remove(child_idx);
+            self.nodes[child_idx as usize].set_check(parent);
+        }
+
+        // Build sibling chain
+        for w in child_indices.windows(2) {
+            self.siblings[w[0] as usize] = w[1];
+        }
+        // Last child's sibling is 0 (no more siblings)
+
+        // Set leaf/has_leaf flags and recurse into non-terminal children
+        for (ci, &(code, child_begin, child_end)) in children.iter().enumerate() {
+            let child_idx = child_indices[ci];
+            if code == 0 {
+                // Terminal symbol — this is a leaf node
+                debug_assert_eq!(child_end - child_begin, 1);
+                let value_id = child_begin as u32;
+                self.nodes[child_idx as usize].set_leaf(value_id);
+                self.nodes[parent as usize].set_has_leaf();
+            } else {
+                // Non-terminal — recurse
+                self.build_rec(coded_keys, child_begin, child_end, depth + 1, child_idx);
+            }
+        }
+    }
+
+    /// Finds a base value such that `base XOR code` is a free slot for each child label.
+    fn find_base(&mut self, children: &[(u32, usize, usize)]) -> u32 {
+        let first_code = children[0].0;
+
+        // Start from the first free slot. We try: base = cursor XOR first_code,
+        // then check if base XOR code is free for all children.
+        let mut cursor = match self.free_list.first_free() {
+            Some(f) => f,
+            None => {
+                let new_cap = self.nodes.len() * 2;
+                self.ensure_capacity(new_cap);
+                (self.nodes.len() / 2) as u32 // first slot of newly grown region
+            }
+        };
+
+        loop {
+            let base = cursor ^ first_code;
+
+            // base must not be 0 (reserved for root check semantics)
+            if base != 0 {
+                // Compute max child index to ensure capacity
+                let max_idx = children
+                    .iter()
+                    .map(|&(code, _, _)| base ^ code)
+                    .max()
+                    .unwrap();
+
+                // Ensure capacity
+                if max_idx as usize >= self.nodes.len() {
+                    let new_cap = (max_idx as usize + 1).next_power_of_two();
+                    self.ensure_capacity(new_cap);
+                }
+
+                let all_free = children
+                    .iter()
+                    .all(|&(code, _, _)| self.free_list.is_free(base ^ code));
+
+                if all_free {
+                    return base;
+                }
+            }
+
+            // Advance cursor to the next free slot
+            let next = self.free_list.next[cursor as usize];
+            if next == 0 {
+                // Wrapped around to sentinel — all current free slots exhausted, grow
+                let new_cap = self.nodes.len() * 2;
+                let new_first = self.free_list.grow(new_cap);
+                self.nodes.resize(new_cap, Node::default());
+                self.siblings.resize(new_cap, 0);
+                cursor = new_first;
+            } else {
+                cursor = next;
+            }
+        }
+    }
+}
+
 impl<L: Label> DoubleArray<L> {
     /// Builds a double-array trie from sorted keys.
     ///
@@ -121,27 +263,13 @@ impl<L: Label> DoubleArray<L> {
             .collect();
 
         let initial_cap = 256.max(coded_keys.len() * 4);
-        let mut nodes: Vec<Node> = vec![Node::default(); initial_cap];
-        let mut siblings: Vec<u32> = vec![0u32; initial_cap];
-        let mut free_list = FreeList::new(initial_cap);
+        let mut ctx = BuildContext::new(initial_cap);
 
-        // Root is at index 0, remove it from free list
-        free_list.remove(0);
-
-        // Build recursively
-        Self::build_rec(
-            &coded_keys,
-            0,
-            keys.len(),
-            0, // depth
-            0, // parent node index
-            &mut nodes,
-            &mut siblings,
-            &mut free_list,
-        );
+        ctx.build_rec(&coded_keys, 0, keys.len(), 0, 0);
 
         // Trim trailing unused nodes
-        let last_used = nodes
+        let last_used = ctx
+            .nodes
             .iter()
             .enumerate()
             .rev()
@@ -149,146 +277,10 @@ impl<L: Label> DoubleArray<L> {
             .map(|(i, _)| i)
             .unwrap_or(0);
         let final_len = last_used + 1;
-        nodes.truncate(final_len);
-        siblings.truncate(final_len);
+        ctx.nodes.truncate(final_len);
+        ctx.siblings.truncate(final_len);
 
-        Self::new(nodes, siblings, code_map)
-    }
-
-    /// Recursively places children for keys[begin..end] at the given depth.
-    /// `parent` is the index of the parent node.
-    #[allow(clippy::too_many_arguments)]
-    fn build_rec(
-        coded_keys: &[Vec<u32>],
-        begin: usize,
-        end: usize,
-        depth: usize,
-        parent: u32,
-        nodes: &mut Vec<Node>,
-        siblings: &mut Vec<u32>,
-        free_list: &mut FreeList,
-    ) {
-        // Collect distinct child labels and their key ranges
-        let mut children: Vec<(u32, usize, usize)> = Vec::new(); // (code, begin, end)
-        let mut i = begin;
-        while i < end {
-            let code = coded_keys[i][depth];
-            let child_begin = i;
-            i += 1;
-            while i < end && coded_keys[i][depth] == code {
-                i += 1;
-            }
-            children.push((code, child_begin, i));
-        }
-
-        // Find a base such that base XOR code is free for all children
-        let base = Self::find_base(&children, nodes, siblings, free_list);
-        nodes[parent as usize].set_base(base);
-
-        // Place child nodes
-        let mut child_indices: Vec<u32> = Vec::with_capacity(children.len());
-        for &(code, _, _) in &children {
-            let child_idx = base ^ code;
-            child_indices.push(child_idx);
-            free_list.remove(child_idx);
-            nodes[child_idx as usize].set_check(parent);
-        }
-
-        // Build sibling chain
-        for w in child_indices.windows(2) {
-            siblings[w[0] as usize] = w[1];
-        }
-        // Last child's sibling is 0 (no more siblings)
-
-        // Set leaf/has_leaf flags and recurse into non-terminal children
-        for (ci, &(code, child_begin, child_end)) in children.iter().enumerate() {
-            let child_idx = child_indices[ci];
-            if code == 0 {
-                // Terminal symbol — this is a leaf node
-                // value_id = the index of the key (there should be exactly one key here)
-                debug_assert_eq!(child_end - child_begin, 1);
-                let value_id = child_begin as u32;
-                nodes[child_idx as usize].set_leaf(value_id);
-                nodes[parent as usize].set_has_leaf();
-            } else {
-                // Non-terminal — recurse
-                Self::build_rec(
-                    coded_keys,
-                    child_begin,
-                    child_end,
-                    depth + 1,
-                    child_idx,
-                    nodes,
-                    siblings,
-                    free_list,
-                );
-            }
-        }
-    }
-
-    /// Finds a base value such that `base XOR code` is a free slot for each child label.
-    fn find_base(
-        children: &[(u32, usize, usize)],
-        nodes: &mut Vec<Node>,
-        siblings: &mut Vec<u32>,
-        free_list: &mut FreeList,
-    ) -> u32 {
-        let first_code = children[0].0;
-
-        // Start from the first free slot. We try: base = cursor XOR first_code,
-        // then check if base XOR code is free for all children.
-        let mut cursor = match free_list.first_free() {
-            Some(f) => f,
-            None => {
-                let new_first = free_list.grow(nodes.len() * 2);
-                nodes.resize(free_list.prev.len(), Node::default());
-                siblings.resize(free_list.prev.len(), 0);
-                new_first
-            }
-        };
-
-        loop {
-            let base = cursor ^ first_code;
-
-            // base must not be 0 (reserved for root check semantics)
-            if base != 0 {
-                // Compute max child index to ensure capacity
-                let max_idx = children
-                    .iter()
-                    .map(|&(code, _, _)| base ^ code)
-                    .max()
-                    .unwrap();
-
-                // Ensure capacity
-                if max_idx as usize >= nodes.len() {
-                    let new_cap = (max_idx as usize + 1).next_power_of_two();
-                    nodes.resize(new_cap, Node::default());
-                    siblings.resize(new_cap, 0);
-                    free_list.grow(new_cap);
-                }
-
-                let all_free = children
-                    .iter()
-                    .all(|&(code, _, _)| free_list.is_free(base ^ code));
-
-                if all_free {
-                    return base;
-                }
-            }
-
-            // Advance cursor to the next free slot
-            let next = free_list.next[cursor as usize];
-            if next == 0 {
-                // Wrapped around to sentinel — all current free slots exhausted, grow
-                let new_cap = nodes.len() * 2;
-                let new_first = free_list.grow(new_cap);
-                nodes.resize(new_cap, Node::default());
-                siblings.resize(new_cap, 0);
-                cursor = new_first;
-            } else {
-                cursor = next;
-            }
-        }
+        Self::new(ctx.nodes, ctx.siblings, code_map)
     }
 }
 
