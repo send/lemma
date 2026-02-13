@@ -105,15 +105,16 @@ fn deserialize_nodes(bytes: &[u8]) -> Option<Vec<Node>> {
     if !bytes.len().is_multiple_of(8) {
         return None;
     }
-    let count = bytes.len() / 8;
-    let mut nodes = Vec::with_capacity(count);
-    for i in 0..count {
-        let offset = i * 8;
-        let base = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
-        let check = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
-        nodes.push(Node::from_raw(base, check));
-    }
-    Some(nodes)
+    Some(
+        bytes
+            .chunks_exact(8)
+            .map(|chunk| {
+                let base = u32::from_le_bytes(chunk[..4].try_into().unwrap());
+                let check = u32::from_le_bytes(chunk[4..].try_into().unwrap());
+                Node::from_raw(base, check)
+            })
+            .collect(),
+    )
 }
 
 fn serialize_u32_slice(data: &[u32]) -> Vec<u8> {
@@ -128,15 +129,12 @@ fn deserialize_u32_slice(bytes: &[u8]) -> Option<Vec<u32>> {
     if !bytes.len().is_multiple_of(4) {
         return None;
     }
-    let count = bytes.len() / 4;
-    let mut data = Vec::with_capacity(count);
-    for i in 0..count {
-        let offset = i * 4;
-        data.push(u32::from_le_bytes(
-            bytes[offset..offset + 4].try_into().unwrap(),
-        ));
-    }
-    Some(data)
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect(),
+    )
 }
 
 #[cfg(test)]

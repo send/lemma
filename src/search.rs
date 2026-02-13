@@ -97,9 +97,8 @@ impl<L: Label> DoubleArray<L> {
         PredictiveIter::new(self, prefix)
     }
 
-    /// Finds the first child of `node_idx` using the sibling chain.
-    /// The first child is at `base(node) XOR 0` (terminal), then follows the sibling chain.
-    /// Returns the index of the first valid child, or None.
+    /// Finds the first child of `node_idx`.
+    /// Checks the terminal child (code 0) first, then scans non-terminal codes.
     fn first_child(&self, node_idx: u32) -> Option<u32> {
         let base = self.nodes[node_idx as usize].base();
         // Terminal child is at base XOR 0 = base (skip self-reference for root with base=0)
@@ -110,16 +109,7 @@ impl<L: Label> DoubleArray<L> {
         {
             return Some(terminal_idx);
         }
-        // If no terminal child, the first non-terminal child must be found.
-        // But the sibling chain starts from the first child placed during build.
-        // We need to scan codes to find any child.
-        // Actually, for nodes with has_leaf, the terminal is the first child.
-        // For nodes without has_leaf, we need another way to find the first child.
-        // Since all internal nodes must have at least one child, and the build places
-        // children starting from code 0, we can check if terminal exists (above),
-        // and if not, we need to search. But the sibling chain only connects siblings
-        // once we have a starting child. For nodes without terminal, we know they have
-        // children (otherwise they wouldn't exist), so we scan from code 1.
+        // No terminal child — scan non-terminal codes to find the first child
         for code in 1..self.code_map.alphabet_size() {
             let idx = base ^ code;
             if (idx as usize) < self.nodes.len() && self.nodes[idx as usize].check() == node_idx {
@@ -184,77 +174,65 @@ struct CommonPrefixIter<'a, L: Label> {
     done: bool,
 }
 
-impl<'a, L: Label> Iterator for CommonPrefixIter<'a, L> {
+impl<L: Label> CommonPrefixIter<'_, L> {
+    /// Checks if the current node has a terminal child and returns the match.
+    fn check_terminal(&self) -> Option<PrefixMatch> {
+        let node = &self.da.nodes[self.node_idx as usize];
+        if !node.has_leaf() {
+            return None;
+        }
+        let terminal_idx = node.base();
+        if terminal_idx as usize >= self.da.nodes.len() {
+            return None;
+        }
+        let terminal = &self.da.nodes[terminal_idx as usize];
+        if terminal.check() == self.node_idx && terminal.is_leaf() {
+            Some(PrefixMatch {
+                len: self.pos,
+                value_id: terminal.value_id(),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Tries to advance to the next query position. Returns false if unable.
+    fn try_advance(&mut self) -> bool {
+        if self.pos >= self.query.len() {
+            return false;
+        }
+        let label = self.query[self.pos];
+        let code = self.da.code_map.get(label);
+        if code == 0 {
+            return false;
+        }
+        let base = self.da.nodes[self.node_idx as usize].base();
+        let next_idx = base ^ code;
+        if next_idx as usize >= self.da.nodes.len()
+            || self.da.nodes[next_idx as usize].check() != self.node_idx
+        {
+            return false;
+        }
+        self.node_idx = next_idx;
+        self.pos += 1;
+        true
+    }
+}
+
+impl<L: Label> Iterator for CommonPrefixIter<'_, L> {
     type Item = PrefixMatch;
 
     fn next(&mut self) -> Option<PrefixMatch> {
-        if self.done {
-            return None;
+        while !self.done {
+            let result = self.check_terminal();
+            if !self.try_advance() {
+                self.done = true;
+            }
+            if result.is_some() {
+                return result;
+            }
         }
-
-        loop {
-            // At each position, check if the current node has a terminal child
-            if self.da.nodes[self.node_idx as usize].has_leaf() {
-                let base = self.da.nodes[self.node_idx as usize].base();
-                // terminal_code = 0, so base XOR 0 = base
-                let terminal_idx = base;
-                if (terminal_idx as usize) < self.da.nodes.len() {
-                    let terminal = &self.da.nodes[terminal_idx as usize];
-                    if terminal.check() == self.node_idx && terminal.is_leaf() {
-                        let result = PrefixMatch {
-                            len: self.pos,
-                            value_id: terminal.value_id(),
-                        };
-
-                        // Try to advance to next position
-                        if self.pos < self.query.len() {
-                            let label = self.query[self.pos];
-                            let code = self.da.code_map.get(label);
-                            if code != 0 {
-                                let next_idx = base ^ code;
-                                if (next_idx as usize) < self.da.nodes.len()
-                                    && self.da.nodes[next_idx as usize].check() == self.node_idx
-                                {
-                                    self.node_idx = next_idx;
-                                    self.pos += 1;
-                                    return Some(result);
-                                }
-                            }
-                            // Cannot advance further
-                            self.done = true;
-                        } else {
-                            self.done = true;
-                        }
-                        return Some(result);
-                    }
-                }
-            }
-
-            // No terminal at current position; try to advance
-            if self.pos >= self.query.len() {
-                self.done = true;
-                return None;
-            }
-
-            let label = self.query[self.pos];
-            let code = self.da.code_map.get(label);
-            if code == 0 {
-                self.done = true;
-                return None;
-            }
-
-            let base = self.da.nodes[self.node_idx as usize].base();
-            let next_idx = base ^ code;
-            if next_idx as usize >= self.da.nodes.len()
-                || self.da.nodes[next_idx as usize].check() != self.node_idx
-            {
-                self.done = true;
-                return None;
-            }
-
-            self.node_idx = next_idx;
-            self.pos += 1;
-        }
+        None
     }
 }
 
