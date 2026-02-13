@@ -1,14 +1,267 @@
-use crate::{DoubleArray, Label, LemmaError};
+use crate::{CodeMapper, DoubleArray, Label, LemmaError, Node};
+
+const MAGIC: &[u8; 4] = b"LMMA";
+const VERSION: u8 = 1;
+const HEADER_SIZE: usize = 4 + 1 + 4 + 4 + 4; // magic + version + 3 lengths = 17
 
 impl<L: Label> DoubleArray<L> {
     /// Serializes the double-array trie to a byte vector.
+    ///
+    /// Format:
+    /// ```text
+    /// Offset  Size  Content
+    /// 0       4     Magic: "LMMA"
+    /// 4       1     Version: 1
+    /// 5       4     nodes_len (u32 LE)
+    /// 9       4     siblings_len (u32 LE)
+    /// 13      4     code_map_len (u32 LE)
+    /// 17      N     nodes data (each node: base LE u32 + check LE u32)
+    /// 17+N    S     siblings data (each: u32 LE)
+    /// 17+N+S  C     code_map data
+    /// ```
     pub fn as_bytes(&self) -> Vec<u8> {
-        let _ = &self.nodes;
-        todo!("as_bytes will be implemented in feat/serialization")
+        // Serialize nodes: each Node is base(u32 LE) + check(u32 LE)
+        let nodes_data = serialize_nodes(&self.nodes);
+        let siblings_data = serialize_u32_slice(&self.siblings);
+        let code_map_data = self.code_map.as_bytes();
+
+        let nodes_len = nodes_data.len() as u32;
+        let siblings_len = siblings_data.len() as u32;
+        let code_map_len = code_map_data.len() as u32;
+
+        let total = HEADER_SIZE + nodes_data.len() + siblings_data.len() + code_map_data.len();
+        let mut buf = Vec::with_capacity(total);
+
+        // Header
+        buf.extend_from_slice(MAGIC);
+        buf.push(VERSION);
+        buf.extend_from_slice(&nodes_len.to_le_bytes());
+        buf.extend_from_slice(&siblings_len.to_le_bytes());
+        buf.extend_from_slice(&code_map_len.to_le_bytes());
+
+        // Data sections
+        buf.extend_from_slice(&nodes_data);
+        buf.extend_from_slice(&siblings_data);
+        buf.extend_from_slice(&code_map_data);
+
+        buf
     }
 
     /// Deserializes a double-array trie from a byte slice.
-    pub fn from_bytes(_bytes: &[u8]) -> Result<Self, LemmaError> {
-        todo!("from_bytes will be implemented in feat/serialization")
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, LemmaError> {
+        if bytes.len() < HEADER_SIZE {
+            return Err(LemmaError::TruncatedData);
+        }
+
+        // Check magic
+        if &bytes[0..4] != MAGIC {
+            return Err(LemmaError::InvalidMagic);
+        }
+
+        // Check version
+        if bytes[4] != VERSION {
+            return Err(LemmaError::InvalidVersion);
+        }
+
+        let nodes_len = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+        let siblings_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
+        let code_map_len = u32::from_le_bytes(bytes[13..17].try_into().unwrap()) as usize;
+
+        let expected_size = HEADER_SIZE + nodes_len + siblings_len + code_map_len;
+        if bytes.len() < expected_size {
+            return Err(LemmaError::TruncatedData);
+        }
+
+        let mut offset = HEADER_SIZE;
+
+        // Deserialize nodes
+        let nodes = deserialize_nodes(&bytes[offset..offset + nodes_len])
+            .ok_or(LemmaError::TruncatedData)?;
+        offset += nodes_len;
+
+        // Deserialize siblings
+        let siblings = deserialize_u32_slice(&bytes[offset..offset + siblings_len])
+            .ok_or(LemmaError::TruncatedData)?;
+        offset += siblings_len;
+
+        // Deserialize code_map
+        let (code_map, _consumed) = CodeMapper::from_bytes(&bytes[offset..offset + code_map_len])
+            .ok_or(LemmaError::TruncatedData)?;
+
+        Ok(Self::new(nodes, siblings, code_map))
+    }
+}
+
+fn serialize_nodes(nodes: &[Node]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(nodes.len() * 8);
+    for node in nodes {
+        // Access raw u32 values via the public accessors, preserving flags
+        // We need to serialize the raw base and check fields including flags.
+        // Since Node is #[repr(C)] with two u32 fields, we can safely transmute.
+        let raw: &[u32; 2] = unsafe { &*(node as *const Node as *const [u32; 2]) };
+        buf.extend_from_slice(&raw[0].to_le_bytes());
+        buf.extend_from_slice(&raw[1].to_le_bytes());
+    }
+    buf
+}
+
+fn deserialize_nodes(bytes: &[u8]) -> Option<Vec<Node>> {
+    if !bytes.len().is_multiple_of(8) {
+        return None;
+    }
+    let count = bytes.len() / 8;
+    let mut nodes = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = i * 8;
+        let base = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        let check = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+        // Reconstruct Node from raw u32 values preserving flags
+        let mut raw = [0u32; 2];
+        raw[0] = base;
+        raw[1] = check;
+        let node: Node = unsafe { std::mem::transmute(raw) };
+        nodes.push(node);
+    }
+    Some(nodes)
+}
+
+fn serialize_u32_slice(data: &[u32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(data.len() * 4);
+    for &v in data {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    buf
+}
+
+fn deserialize_u32_slice(bytes: &[u8]) -> Option<Vec<u32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let count = bytes.len() / 4;
+    let mut data = Vec::with_capacity(count);
+    for i in 0..count {
+        let offset = i * 4;
+        data.push(u32::from_le_bytes(
+            bytes[offset..offset + 4].try_into().unwrap(),
+        ));
+    }
+    Some(data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DoubleArray;
+
+    #[test]
+    fn round_trip_empty() {
+        let da = build_empty_u8();
+        let bytes = da.as_bytes();
+        let da2 = DoubleArray::<u8>::from_bytes(&bytes).unwrap();
+        assert_eq!(da.nodes, da2.nodes);
+        assert_eq!(da.siblings, da2.siblings);
+    }
+
+    #[test]
+    fn round_trip_u8() {
+        let keys: Vec<&[u8]> = vec![b"a", b"ab", b"abc", b"b", b"bc"];
+        let da = DoubleArray::<u8>::build(&keys);
+        let bytes = da.as_bytes();
+        let da2 = DoubleArray::<u8>::from_bytes(&bytes).unwrap();
+
+        // Verify all searches work the same
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(da2.exact_match(key), Some(i as u32));
+        }
+        assert_eq!(da2.exact_match(b"xyz"), None);
+    }
+
+    #[test]
+    fn round_trip_char() {
+        let keys: Vec<Vec<char>> = vec![
+            "あ".chars().collect(),
+            "あい".chars().collect(),
+            "あいう".chars().collect(),
+            "か".chars().collect(),
+        ];
+        let da = DoubleArray::<char>::build(&keys);
+        let bytes = da.as_bytes();
+        let da2 = DoubleArray::<char>::from_bytes(&bytes).unwrap();
+
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(da2.exact_match(key), Some(i as u32));
+        }
+    }
+
+    fn build_empty_u8() -> DoubleArray<u8> {
+        let keys: Vec<&[u8]> = vec![];
+        DoubleArray::<u8>::build(&keys)
+    }
+
+    #[test]
+    fn invalid_magic() {
+        let mut bytes = build_empty_u8().as_bytes();
+        bytes[0] = b'X';
+        assert!(matches!(
+            DoubleArray::<u8>::from_bytes(&bytes),
+            Err(LemmaError::InvalidMagic)
+        ));
+    }
+
+    #[test]
+    fn invalid_version() {
+        let mut bytes = build_empty_u8().as_bytes();
+        bytes[4] = 99;
+        assert!(matches!(
+            DoubleArray::<u8>::from_bytes(&bytes),
+            Err(LemmaError::InvalidVersion)
+        ));
+    }
+
+    #[test]
+    fn truncated_data() {
+        let bytes = build_empty_u8().as_bytes();
+        assert!(matches!(
+            DoubleArray::<u8>::from_bytes(&bytes[..HEADER_SIZE]),
+            Err(LemmaError::TruncatedData)
+        ));
+    }
+
+    #[test]
+    fn truncated_header() {
+        assert!(matches!(
+            DoubleArray::<u8>::from_bytes(&[0; 4]),
+            Err(LemmaError::TruncatedData)
+        ));
+    }
+
+    #[test]
+    fn round_trip_preserves_search_behavior() {
+        let keys: Vec<&[u8]> = vec![b"n", b"na", b"ni", b"nu", b"shi"];
+        let da = DoubleArray::<u8>::build(&keys);
+        let bytes = da.as_bytes();
+        let da2 = DoubleArray::<u8>::from_bytes(&bytes).unwrap();
+
+        // Test exact_match
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(da2.exact_match(key), Some(i as u32));
+        }
+
+        // Test probe
+        let r = da2.probe(b"n");
+        assert_eq!(r.value, Some(0));
+        assert!(r.has_children);
+
+        let r = da2.probe(b"shi");
+        assert_eq!(r.value, Some(4));
+        assert!(!r.has_children);
+
+        // Test common_prefix_search
+        let results: Vec<_> = da2.common_prefix_search(b"nab").collect();
+        assert_eq!(results.len(), 2); // "n" and "na"
+
+        // Test predictive_search
+        let results: Vec<_> = da2.predictive_search(b"n").collect();
+        assert_eq!(results.len(), 4); // "n", "na", "ni", "nu"
     }
 }

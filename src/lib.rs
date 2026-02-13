@@ -38,7 +38,6 @@ impl std::error::Error for LemmaError {}
 /// A double-array trie supporting exact match, common prefix search,
 /// predictive search, and probe operations.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct DoubleArray<L: Label> {
     pub(crate) nodes: Vec<Node>,
     pub(crate) siblings: Vec<u32>,
@@ -48,7 +47,6 @@ pub struct DoubleArray<L: Label> {
 
 impl<L: Label> DoubleArray<L> {
     /// Creates a new DoubleArray with the given components.
-    #[allow(dead_code)]
     pub(crate) fn new(nodes: Vec<Node>, siblings: Vec<u32>, code_map: CodeMapper) -> Self {
         Self {
             nodes,
