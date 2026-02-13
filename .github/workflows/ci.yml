@@ -1,0 +1,17 @@
+name: CI
+on: pull_request
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - uses: jdx/mise-action@v2
+      - run: mise run fmt:check
+      - run: mise run check
+      - run: mise run build
+      - run: mise run test
