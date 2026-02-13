@@ -17,3 +17,7 @@ run = "cargo fmt"
 [tasks."fmt:check"]
 description = "Check formatting"
 run = "cargo fmt --check"
+
+[tasks.bench]
+description = "Run benchmarks"
+run = "cargo bench"
